@@ -17,6 +17,8 @@
 
 package org.apache.spark.shuffle
 
+import org.apache.spark.util.collection.Spillable
+
 import scala.collection.mutable
 
 import org.apache.spark.{Logging, SparkException, SparkConf}
@@ -36,7 +38,8 @@ import org.apache.spark.{Logging, SparkException, SparkConf}
  * wait() and notifyAll() to signal changes.
  */
 private[spark] class ShuffleMemoryManager(maxMemory: Long) extends Logging {
-  private val threadMemory = new mutable.HashMap[Long, Long]()  // threadId -> memory bytes
+  //The assumption is each thread can have only one occupant at a time, this restriciton can be losen up actually!!TODO
+  private val threadMemory = new mutable.HashMap[Long,(Spillable[_], Long)]()  // threadId -> (object, that's holding the memory, memory bytes)
 
   def this(conf: SparkConf) = this(ShuffleMemoryManager.getMaxMemory(conf))
 
@@ -47,24 +50,37 @@ private[spark] class ShuffleMemoryManager(maxMemory: Long) extends Logging {
    * total memory pool (where N is the # of active threads) before it is forced to spill. This can
    * happen if the number of threads increases but an older thread had a lot of memory already.
    */
-  def tryToAcquire(numBytes: Long): Long = synchronized {
+  def tryToAcquire(asker:Spillable[_], numBytes: Long, expelPrevious: Boolean = true): Long = synchronized {//TODO: remove the expelPrevious flag
     val threadId = Thread.currentThread().getId
+    logInfo(s"Thread ${threadId} is trying to acquire ${numBytes}")
+    logInfo(s"current memory allocation ${threadMemory.map{case (k, (v1,v2)) => (k, v2)}}")
     assert(numBytes > 0, "invalid number of bytes requested: " + numBytes)
 
+    // may need to kickout current occupant
+    if (threadMemory.contains(threadId)) {
+      val (currentOccupent, currentMem) = threadMemory(threadId)
+      if (currentOccupent != asker && expelPrevious) {
+        logInfo(s"Thread ${threadId} is freeing up ${System.identityHashCode(currentOccupent)} to make space for ${System.identityHashCode(asker)}")
+        currentOccupent.doSpill(currentMem) // Notice, after spilling the threadMemory may not contain the threadID anymore, that's why following is doing a null check...TODO: to be refactored
+      }
+    }
     // Add this thread to the threadMemory map just so we can keep an accurate count of the number
     // of active threads, to let other threads ramp down their memory in calls to tryToAcquire
     if (!threadMemory.contains(threadId)) {
-      threadMemory(threadId) = 0L
+      threadMemory(threadId) = (asker, 0L)
       notifyAll()  // Will later cause waiting threads to wake up and check numThreads again
     }
+
+
 
     // Keep looping until we're either sure that we don't want to grant this request (because this
     // thread would have more than 1 / numActiveThreads of the memory) or we have enough free
     // memory to give it (we always let each thread get at least 1 / (2 * numActiveThreads)).
     while (true) {
       val numActiveThreads = threadMemory.keys.size
-      val curMem = threadMemory(threadId)
-      val freeMemory = maxMemory - threadMemory.values.sum
+      val curMem = threadMemory(threadId)._2
+
+      val freeMemory:Long = maxMemory - threadMemory.values.map(_._2).sum
 
       // How much we can grant this thread; don't let it grow to more than 1 / numActiveThreads
       val maxToGrant = math.min(numBytes, (maxMemory / numActiveThreads) - curMem)
@@ -75,7 +91,8 @@ private[spark] class ShuffleMemoryManager(maxMemory: Long) extends Logging {
         // (this happens if older threads allocated lots of memory before N grew)
         if (freeMemory >= math.min(maxToGrant, maxMemory / (2 * numActiveThreads) - curMem)) {
           val toGrant = math.min(maxToGrant, freeMemory)
-          threadMemory(threadId) += toGrant
+          val (occupant, mem) = threadMemory(threadId)
+          threadMemory(threadId) = (occupant, mem + toGrant)
           return toGrant
         } else {
           logInfo(s"Thread $threadId waiting for at least 1/2N of shuffle memory pool to be free")
@@ -84,7 +101,8 @@ private[spark] class ShuffleMemoryManager(maxMemory: Long) extends Logging {
       } else {
         // Only give it as much memory as is free, which might be none if it reached 1 / numThreads
         val toGrant = math.min(maxToGrant, freeMemory)
-        threadMemory(threadId) += toGrant
+        val (occupant, mem) = threadMemory(threadId)
+        threadMemory(threadId) = (occupant, mem + toGrant)
         return toGrant
       }
     }
@@ -92,20 +110,28 @@ private[spark] class ShuffleMemoryManager(maxMemory: Long) extends Logging {
   }
 
   /** Release numBytes bytes for the current thread. */
-  def release(numBytes: Long): Unit = synchronized {
+  def release(asker:Spillable[_], numBytes: Long): Unit = synchronized {
     val threadId = Thread.currentThread().getId
-    val curMem = threadMemory.getOrElse(threadId, 0L)
-    if (curMem < numBytes) {
-      throw new SparkException(
-        s"Internal error: release called on ${numBytes} bytes but thread only has ${curMem}")
+    val (occupant, mem) = threadMemory(threadId)
+    if (asker != occupant) {
+      throw new RuntimeException(s"can not release ${System.identityHashCode(asker)}, since the current occupant is ${System.identityHashCode(occupant)}")
     }
-    threadMemory(threadId) -= numBytes
+    if (mem < numBytes) {
+      throw new SparkException(
+        s"Internal error: release called on ${numBytes} bytes but thread only has ${mem}")
+    }
+    if (mem == numBytes) {
+      threadMemory.remove(threadId)
+    } else {
+      threadMemory(threadId) = (occupant, mem - numBytes)
+    }
     notifyAll()  // Notify waiters who locked "this" in tryToAcquire that memory has been freed
   }
 
   /** Release all memory for the current thread and mark it as inactive (e.g. when a task ends). */
   def releaseMemoryForThisThread(): Unit = synchronized {
     val threadId = Thread.currentThread().getId
+    logInfo(s"Thread $threadId is freed!")
     threadMemory.remove(threadId)
     notifyAll()  // Notify waiters who locked "this" in tryToAcquire that memory has been freed
   }

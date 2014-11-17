@@ -17,6 +17,7 @@
 
 package org.apache.spark.util.collection
 
+import java.util
 import java.util.{Arrays, Comparator}
 
 import com.google.common.hash.Hashing
@@ -270,7 +271,8 @@ class AppendOnlyMap[K, V](initialCapacity: Int = 64)
 
     new Sorter(new KVArraySortDataFormat[K, AnyRef]).sort(data, 0, newIndex, keyComparator)
 
-    new Iterator[(K, V)] {
+    // An iterator that knows the current index
+    new CountedIterator[(K, V)] {
       var i = 0
       var nullValueReady = haveNullValue
       def hasNext: Boolean = (i < newIndex || nullValueReady)
@@ -284,6 +286,7 @@ class AppendOnlyMap[K, V](initialCapacity: Int = 64)
           item
         }
       }
+      override def currentIndex = i
     }
   }
 
@@ -291,4 +294,9 @@ class AppendOnlyMap[K, V](initialCapacity: Int = 64)
    * Return whether the next insert will cause the map to grow
    */
   def atGrowThreshold: Boolean = curSize == growThreshold
+}
+
+
+abstract class CountedIterator[E] extends Iterator[E] {
+  def currentIndex:Int
 }

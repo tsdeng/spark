@@ -189,11 +189,13 @@ private[spark] class ExternalSorter[K, V, C](
     blockId: BlockId,
     serializerBatchSizes: Array[Long],
     elementsPerPartition: Array[Long])
-  private val spills = new ArrayBuffer[SpilledFile]
 
+  private val spills = new ArrayBuffer[SpilledFile]
+  val shouldCombine = aggregator.isDefined
+  val usingMap = if (shouldCombine) true else false
   def insertAll(records: Iterator[_ <: Product2[K, V]]): Unit = {
     // TODO: stop combining if we find that the reduction factor isn't high
-    val shouldCombine = aggregator.isDefined
+
 
     if (shouldCombine) {
       // Combine values in-memory first using our AppendOnlyMap
@@ -231,24 +233,38 @@ private[spark] class ExternalSorter[K, V, C](
     }
 
     if (usingMap) {
-      if (maybeSpill(map, map.estimateSize())) {
+      if (maybeSpill(map.estimateSize())) {
+        elementsRead = 0L
         map = new SizeTrackingAppendOnlyMap[(Int, K), C]
       }
     } else {
-      if (maybeSpill(buffer, buffer.estimateSize())) {
+      if (maybeSpill(buffer.estimateSize())) {
+        elementsRead = 0L
         buffer = new SizeTrackingPairBuffer[(Int, K), C]
       }
     }
   }
 
+
+//  override protected[this] def spill(collection: SizeTrackingPairCollection[(Int, K), C]): Unit = {
+//    if (bypassMergeSort) {
+//      spillToPartitionFiles(collection)
+//    } else {
+//      spillToMergeableFile(collection)
+//    }
+//  }
+
   /**
    * Spill the current in-memory collection to disk, adding a new file to spills, and clear it.
    */
-  override protected[this] def spill(collection: SizeTrackingPairCollection[(Int, K), C]): Unit = {
-    if (bypassMergeSort) {
-      spillToPartitionFiles(collection)
-    } else {
-      spillToMergeableFile(collection)
+  override def spillMySelf : Unit = {
+    val toSpill = if (usingMap) map else buffer
+    if (!toSpill.isEmpty) {
+      if (bypassMergeSort) {
+        spillToPartitionFiles(toSpill)
+      } else {
+        spillToMergeableFile(toSpill)
+      }
     }
   }
 
