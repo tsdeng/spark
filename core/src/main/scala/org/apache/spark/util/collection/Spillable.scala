@@ -29,23 +29,23 @@ private[spark] trait Spillable[C] {
   this: Logging =>
 
   /**
-   * Spills the current in-memory collection to disk, and releases the memory.
-   *
-   * @param collection collection to spill to disk
+   * Spills the current in-memory collection to disk
    */
-  protected def spill(collection: C): Unit
+  def spill: Unit
 
   // Number of elements read from input since last spill
-  protected var elementsRead: Long
+  private[spark] var elementsRead: Long
 
   // Memory manager that can be used to acquire/release memory
   private[this] val shuffleMemoryManager = SparkEnv.get.shuffleMemoryManager
 
   // What threshold of elementsRead we start estimating collection size at
-  private[this] val trackMemoryThreshold = 1000
+  private[this] val _trackMemoryThreshold = 1000
+
+  private[spark] def trackMemoryThreshold = _trackMemoryThreshold
 
   // How much of the shared memory pool this collection has claimed
-  private[this] var myMemoryThreshold = 0L
+  private[spark] var allocatedMemory = 0L
 
   // Number of bytes spilled in total
   private[this] var _memoryBytesSpilled = 0L
@@ -57,33 +57,20 @@ private[spark] trait Spillable[C] {
    * Spills the current in-memory collection to disk if needed. Attempts to acquire more
    * memory before spilling.
    *
-   * @param collection collection to spill to disk
-   * @param currentMemory estimated size of the collection in bytes
    * @return true if `collection` was spilled to disk; false otherwise
    */
-  protected def maybeSpill(collection: C, currentMemory: Long): Boolean = {
-    if (elementsRead > trackMemoryThreshold && elementsRead % 32 == 0 &&
-        currentMemory >= myMemoryThreshold) {
-      // Claim up to double our current memory from the shuffle memory pool
-      val amountToRequest = 2 * currentMemory - myMemoryThreshold
-      val granted = shuffleMemoryManager.tryToAcquire(amountToRequest)
-      myMemoryThreshold += granted
-      if (myMemoryThreshold <= currentMemory) {
-        // We were granted too little memory to grow further (either tryToAcquire returned 0,
-        // or we already had more memory than myMemoryThreshold); spill the current collection
-        _spillCount += 1
-        logSpillage(currentMemory)
-
-        spill(collection)
-
-        // Keep track of spills, and release memory
-        _memoryBytesSpilled += currentMemory
-        releaseMemoryForThisThread()
-        return true
-      }
-    }
-    false
+  protected def maybeSpill(): Boolean = {
+    shuffleMemoryManager.getThreadMemoryManager.maybeSpill(this)
   }
+
+  /**
+   * The size of memory used. [[org.apache.spark.shuffle.ShuffleMemoryManager]] uses it to decide
+   * if to spill current obj
+   * @return
+   */
+  def memorySize: Long
+
+  private def increaseSpillCount() = { _spillCount += 1 }
 
   /**
    * @return number of bytes spilled in total
@@ -91,21 +78,14 @@ private[spark] trait Spillable[C] {
   def memoryBytesSpilled: Long = _memoryBytesSpilled
 
   /**
-   * Release our memory back to the shuffle pool so that other threads can grab it.
-   */
-  private def releaseMemoryForThisThread(): Unit = {
-    shuffleMemoryManager.release(myMemoryThreshold)
-    myMemoryThreshold = 0L
-  }
-
-  /**
    * Prints a standard log message detailing spillage.
    *
    * @param size number of bytes spilled
    */
-  @inline private def logSpillage(size: Long) {
+  def logSpillage(size: Long) {
+    increaseSpillCount()
     val threadId = Thread.currentThread().getId
-    logInfo("Thread %d spilling in-memory map of %d MB to disk (%d time%s so far)"
-        .format(threadId, size / (1024 * 1024), _spillCount, if (_spillCount > 1) "s" else ""))
+    logInfo("Thread %d spilling in-memory map of %d to disk (%d time%s so far)"
+        .format(threadId, size , _spillCount, if (_spillCount > 1) "s" else ""))
   }
 }

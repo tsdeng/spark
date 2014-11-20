@@ -27,8 +27,11 @@ import org.apache.spark.io.CompressionCodec
 
 class ExternalAppendOnlyMapSuite extends FunSuite with LocalSparkContext {
   private val allCompressionCodecs = CompressionCodec.ALL_COMPRESSION_CODECS
+
   private def createCombiner[T](i: T) = ArrayBuffer[T](i)
+
   private def mergeValue[T](buffer: ArrayBuffer[T], i: T): ArrayBuffer[T] = buffer += i
+
   private def mergeCombiners[T](buf1: ArrayBuffer[T], buf2: ArrayBuffer[T]): ArrayBuffer[T] =
     buf1 ++= buf2
 
@@ -49,29 +52,89 @@ class ExternalAppendOnlyMapSuite extends FunSuite with LocalSparkContext {
     conf
   }
 
-  test("simple insert") {
+  // util for creating an ExternalAppendOnlyMap
+  def withExternalMap[T](f: ExternalAppendOnlyMap[T, T, ArrayBuffer[T]] => Unit) = {
     val conf = createSparkConf(loadDefaults = false)
     sc = new SparkContext("local", "test", conf)
-    val map = createExternalMap[Int]
-
-    // Single insert
-    map.insert(1, 10)
-    var it = map.iterator
-    assert(it.hasNext)
-    val kv = it.next()
-    assert(kv._1 === 1 && kv._2 === ArrayBuffer[Int](10))
-    assert(!it.hasNext)
-
-    // Multiple insert
-    map.insert(2, 20)
-    map.insert(3, 30)
-    it = map.iterator
-    assert(it.hasNext)
-    assert(it.toSet === Set[(Int, ArrayBuffer[Int])](
-      (1, ArrayBuffer[Int](10)),
-      (2, ArrayBuffer[Int](20)),
-      (3, ArrayBuffer[Int](30))))
+    val map = createExternalMap[T]
+    f(map)
     sc.stop()
+  }
+
+  test("use iterator after spilling") {
+    //use iterator after spilling
+    withExternalMap[Int] { map =>
+      map.insert(1, 2)
+      map.insert(1, 3)
+      map.insert(3, 4)
+      val it = map.iterator
+      map.spill
+      assert(it.toSet === Set[(Int, ArrayBuffer[Int])](
+        (1, ArrayBuffer[Int](2, 3)),
+        (3, ArrayBuffer[Int](4))))
+    }
+
+    //read, spill and read again
+    withExternalMap[Int] { map =>
+      map.insert(1, 2)
+      map.insert(1, 3)
+      map.insert(3, 4)
+      val it = map.iterator
+      it.next()
+      assert(it.toSet === Set[(Int, ArrayBuffer[Int])](
+        (3, ArrayBuffer[Int](4))))
+    }
+
+
+  }
+
+  test("finalize when an iterator is exported") {
+
+    // can only get iterator once
+    var thrown = intercept[RuntimeException] {
+      withExternalMap[Int] { map =>
+        map.insert(1, 2)
+        map.iterator
+        map.iterator
+      }
+    }
+    assert( thrown.getMessage == "Iterator is exported, map is finalized" )
+
+    //after exporting an iterator, should not be able to insert
+    thrown = intercept[RuntimeException] {
+      withExternalMap[Int] { map =>
+        map.insert(1, 2)
+        map.iterator
+        map.insert(1, 3)
+      }
+    }
+    assert( thrown.getMessage == "Iterator is exported, map is finalized" )
+  }
+
+  test("simple insert") {
+     withExternalMap[Int] {
+       map =>
+       // Single insert
+       map.insert(1, 10)
+       val it = map.iterator
+       assert(it.hasNext)
+       val kv = it.next()
+       assert(kv._1 === 1 && kv._2 === ArrayBuffer[Int](10))
+       assert(!it.hasNext)
+     }
+
+    withExternalMap[Int] { map =>
+      // Multiple insert
+      map.insert(1, 10)
+      map.insert(2, 20)
+      map.insert(3, 30)
+      val it = map.iterator
+      assert(it.hasNext)
+      assert(it.toSet === Set[(Int, ArrayBuffer[Int])](
+        (1, ArrayBuffer[Int](10)),
+        (2, ArrayBuffer[Int](20)),
+        (3, ArrayBuffer[Int](30))))
+    }
   }
 
   test("insert with collision") {
@@ -140,44 +203,21 @@ class ExternalAppendOnlyMapSuite extends FunSuite with LocalSparkContext {
   }
 
   test("null keys and values") {
-    val conf = createSparkConf(loadDefaults = false)
-    sc = new SparkContext("local", "test", conf)
-
-    val map = createExternalMap[Int]
-    map.insert(1, 5)
-    map.insert(2, 6)
-    map.insert(3, 7)
-    assert(map.size === 3)
-    assert(map.iterator.toSet === Set[(Int, Seq[Int])](
-      (1, Seq[Int](5)),
-      (2, Seq[Int](6)),
-      (3, Seq[Int](7))
-    ))
-
-    // Null keys
-    val nullInt = null.asInstanceOf[Int]
-    map.insert(nullInt, 8)
-    assert(map.size === 4)
-    assert(map.iterator.toSet === Set[(Int, Seq[Int])](
-      (1, Seq[Int](5)),
-      (2, Seq[Int](6)),
-      (3, Seq[Int](7)),
-      (nullInt, Seq[Int](8))
-    ))
-
-    // Null values
-    map.insert(4, nullInt)
-    map.insert(nullInt, nullInt)
-    assert(map.size === 5)
-    val result = map.iterator.toSet[(Int, ArrayBuffer[Int])].map(kv => (kv._1, kv._2.toSet))
-    assert(result === Set[(Int, Set[Int])](
-      (1, Set[Int](5)),
-      (2, Set[Int](6)),
-      (3, Set[Int](7)),
-      (4, Set[Int](nullInt)),
-      (nullInt, Set[Int](nullInt, 8))
-    ))
-    sc.stop()
+    withExternalMap[Int] { map =>
+      map.insert(1, 5)
+      map.insert(2, 6)
+      map.insert(3, 7)
+      // Null keys
+      val nullInt = null.asInstanceOf[Int]
+      map.insert(nullInt, nullInt)
+      map.insert(nullInt, 8)
+      assert(map.iterator.toSet === Set[(Int, ArrayBuffer[Int])](
+        (1, ArrayBuffer[Int](5)),
+        (2, ArrayBuffer[Int](6)),
+        (3, ArrayBuffer[Int](7)),
+        (nullInt, ArrayBuffer[Int](nullInt, 8))
+      ))
+    }
   }
 
   test("simple aggregator") {

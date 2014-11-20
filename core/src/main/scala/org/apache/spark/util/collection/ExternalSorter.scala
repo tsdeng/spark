@@ -121,7 +121,7 @@ private[spark] class ExternalSorter[K, V, C](
 
   // Number of pairs read from input since last spill; note that we count them even if a value is
   // merged with a previous key in case we're doing something like groupBy where the result grows
-  protected[this] var elementsRead = 0L
+  private[spark] var elementsRead = 0L
 
   // Total spilling statistics
   private var _diskBytesSpilled = 0L
@@ -153,7 +153,7 @@ private[spark] class ExternalSorter[K, V, C](
       if (h1 < h2) -1 else if (h1 == h2) 0 else 1
     }
   })
-
+  //TODO spillable
   // A comparator for (Int, K) pairs that orders them by only their partition ID
   private val partitionComparator: Comparator[(Int, K)] = new Comparator[(Int, K)] {
     override def compare(a: (Int, K), b: (Int, K)): Int = {
@@ -189,11 +189,13 @@ private[spark] class ExternalSorter[K, V, C](
     blockId: BlockId,
     serializerBatchSizes: Array[Long],
     elementsPerPartition: Array[Long])
-  private val spills = new ArrayBuffer[SpilledFile]
 
+  private val spills = new ArrayBuffer[SpilledFile]
+  val shouldCombine = aggregator.isDefined
+  val usingMap = if (shouldCombine) true else false
   def insertAll(records: Iterator[_ <: Product2[K, V]]): Unit = {
     // TODO: stop combining if we find that the reduction factor isn't high
-    val shouldCombine = aggregator.isDefined
+
 
     if (shouldCombine) {
       // Combine values in-memory first using our AppendOnlyMap
@@ -231,24 +233,31 @@ private[spark] class ExternalSorter[K, V, C](
     }
 
     if (usingMap) {
-      if (maybeSpill(map, map.estimateSize())) {
+      if (maybeSpill()) {
+        elementsRead = 0L
         map = new SizeTrackingAppendOnlyMap[(Int, K), C]
       }
     } else {
-      if (maybeSpill(buffer, buffer.estimateSize())) {
+      if (maybeSpill()) {
+        elementsRead = 0L
         buffer = new SizeTrackingPairBuffer[(Int, K), C]
       }
     }
   }
 
+  override def memorySize = if (usingMap) map.estimateSize() else buffer.estimateSize()
+
   /**
    * Spill the current in-memory collection to disk, adding a new file to spills, and clear it.
    */
-  override protected[this] def spill(collection: SizeTrackingPairCollection[(Int, K), C]): Unit = {
-    if (bypassMergeSort) {
-      spillToPartitionFiles(collection)
-    } else {
-      spillToMergeableFile(collection)
+  override def spill : Unit = {
+    val toSpill = if (usingMap) map else buffer
+    if (!toSpill.isEmpty) {
+      if (bypassMergeSort) {
+        spillToPartitionFiles(toSpill)
+      } else {
+        spillToMergeableFile(toSpill)
+      }
     }
   }
 

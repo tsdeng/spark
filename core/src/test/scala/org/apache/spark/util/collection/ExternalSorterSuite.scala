@@ -320,7 +320,7 @@ class ExternalSorterSuite extends FunSuite with LocalSparkContext with PrivateMe
     conf.set("spark.shuffle.memoryFraction", "0.001")
     conf.set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.SortShuffleManager")
     sc = new SparkContext("local", "test", conf)
-    val diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
+    var diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
 
     val ord = implicitly[Ordering[Int]]
 
@@ -332,6 +332,8 @@ class ExternalSorterSuite extends FunSuite with LocalSparkContext with PrivateMe
     sorter.stop()
     assert(diskBlockManager.getAllBlocks().length === 0)
 
+    sc = new SparkContext("local", "test", conf)
+    diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
     val sorter2 = new ExternalSorter[Int, Int, Int](
       None, Some(new HashPartitioner(3)), Some(ord), None)
     assertDidNotBypassMergeSort(sorter2)
@@ -347,7 +349,7 @@ class ExternalSorterSuite extends FunSuite with LocalSparkContext with PrivateMe
     conf.set("spark.shuffle.memoryFraction", "0.001")
     conf.set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.SortShuffleManager")
     sc = new SparkContext("local", "test", conf)
-    val diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
+    var diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
 
     val sorter = new ExternalSorter[Int, Int, Int](None, Some(new HashPartitioner(3)), None, None)
     assertBypassedMergeSort(sorter)
@@ -356,6 +358,8 @@ class ExternalSorterSuite extends FunSuite with LocalSparkContext with PrivateMe
     sorter.stop()
     assert(diskBlockManager.getAllBlocks().length === 0)
 
+    sc = new SparkContext("local", "test", conf)
+    diskBlockManager = SparkEnv.get.blockManager.diskBlockManager
     val sorter2 = new ExternalSorter[Int, Int, Int](None, Some(new HashPartitioner(3)), None, None)
     assertBypassedMergeSort(sorter2)
     sorter2.insertAll((0 until 100000).iterator.map(i => (i, i)))
@@ -739,6 +743,7 @@ class ExternalSorterSuite extends FunSuite with LocalSparkContext with PrivateMe
     assert(thrown.getMessage().contains("Comparison method violates its general contract"))
     sorter1.stop()
 
+    sc = new SparkContext("local-cluster[1,1,512]", "test", conf)
     // Using aggregation and external spill to make sure ExternalSorter using
     // partitionKeyComparator.
     def createCombiner(i: String) = ArrayBuffer(i)

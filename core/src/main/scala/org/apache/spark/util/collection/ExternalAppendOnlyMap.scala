@@ -58,6 +58,17 @@ import org.apache.spark.executor.ShuffleWriteMetrics
  *
  *   `spark.shuffle.safetyFraction` specifies an additional margin of safety as a fraction of
  *   this threshold, in case map size estimation is not sufficiently accurate.
+ *
+ *   Each map can return only one iterator, after the iterator is returned, it's considered to be
+ *   finalized and the content of it can not be changed.
+ *
+ *   The iterator returned by a map could be in 3 states
+ *   1. iterator of the memoryMap: the ExternalAppendOnlyMap completely fits in memory
+ *   2. external iterator of memoryMap and spilledMaps: some data are spill to disk and some data are in memoryMap
+ *   3. spilled iterator: all the data is spilled to disk for saving memory
+ *
+ *   calling [[ExternalAppendOnlyMap#spillMySelf}]] will lead to an iterator to transform from state 1 or 2 to state 3
+ *
  */
 @DeveloperApi
 class ExternalAppendOnlyMap[K, V, C](
@@ -71,14 +82,16 @@ class ExternalAppendOnlyMap[K, V, C](
   with Logging
   with Spillable[SizeTracker] {
 
-  private var currentMap = new SizeTrackingAppendOnlyMap[K, C]
+  private var memoryMap = new SizeTrackingAppendOnlyMap[K, C]
   private val spilledMaps = new ArrayBuffer[DiskMapIterator]
+  // Each map can have only 1 externalIterator
+  private var exportedIterator:Option[Iterator[(K,C)]] = None
   private val sparkConf = SparkEnv.get.conf
   private val diskBlockManager = blockManager.diskBlockManager
 
   // Number of pairs inserted since last spill; note that we count them even if a value is merged
   // with a previous key in case we're doing something like groupBy where the result grows
-  protected[this] var elementsRead = 0L
+  override private[spark] var elementsRead = 0L
 
   /**
    * Size of object batches when reading/writing from serializers.
@@ -102,6 +115,13 @@ class ExternalAppendOnlyMap[K, V, C](
   private val keyComparator = new HashComparator[K]
   private val ser = serializer.newInstance()
 
+
+  def assertNotFinalized: Unit = {
+    exportedIterator match {
+      case Some(_) => sys.error("Iterator is exported, map is finalized")
+      case None => Unit
+    }
+  }
   /**
    * Insert the given key and value into the map.
    */
@@ -119,6 +139,7 @@ class ExternalAppendOnlyMap[K, V, C](
    * The shuffle memory usage of the first trackMemoryThreshold entries is not tracked.
    */
   def insertAll(entries: Iterator[Product2[K, V]]): Unit = {
+    assertNotFinalized
     // An update function for the map that we reuse across entries to avoid allocating
     // a new closure each time
     var curEntry: Product2[K, V] = null
@@ -128,12 +149,47 @@ class ExternalAppendOnlyMap[K, V, C](
 
     while (entries.hasNext) {
       curEntry = entries.next()
-      if (maybeSpill(currentMap, currentMap.estimateSize())) {
-        currentMap = new SizeTrackingAppendOnlyMap[K, C]
+      if (maybeSpill()) {
+        memoryMap = new SizeTrackingAppendOnlyMap[K, C]
       }
-      currentMap.changeValue(curEntry._1, update)
+      memoryMap.changeValue(curEntry._1, update)
       elementsRead += 1
     }
+  }
+
+  override def memorySize = memoryMap.estimateSize()
+
+  override def spill: Unit = {
+    // When spill after an iterator is returned, it needs to update the exported iterator after spilling.
+    // So the memory retained by the memory iterator can be recycled
+    def spillExportedIterator(it: Iterator[(K,C)]) = {
+      it match {
+        case  exIt: SpillableExternalIterator => exIt.spillMemoryIterator(spillIterator(_))
+        case memIt: SpillableMemIterator => memIt.spill(spillIterator(_))
+      }
+    }
+
+    // This method is called when iterator is not returned
+    def spillInMemoryMap = {
+      val memoryIterator = memoryMap.destructiveSortedIterator(keyComparator)
+      val diskIterator = spillIterator(memoryIterator)
+      spilledMaps.append(diskIterator)
+      elementsRead = 0
+    }
+
+    try {
+      logInfo(s"in spillMyself, spilling obj${System.identityHashCode(this)}")
+      exportedIterator match {
+        case Some(it) => spillExportedIterator(it)
+        //Haven't exported any external iterator, normal code path
+        case None => spillInMemoryMap
+      }
+    } catch {
+      case err:AssertionError => logInfo(s"!!!!!Error in spilling myself: ${err}")
+    }
+
+    //release currentMap to recycle memory
+    if (!memoryMap.isEmpty) memoryMap = new SizeTrackingAppendOnlyMap[K, C]
   }
 
   /**
@@ -149,10 +205,7 @@ class ExternalAppendOnlyMap[K, V, C](
     insertAll(entries.iterator)
   }
 
-  /**
-   * Sort the existing contents of the in-memory map and spill them to a temporary file on disk.
-   */
-  override protected[this] def spill(collection: SizeTracker): Unit = {
+  private def spillIterator(it: Iterator[(K,C)]): DiskMapIterator = {
     val (blockId, file) = diskBlockManager.createTempLocalBlock()
     curWriteMetrics = new ShuffleWriteMetrics()
     var writer = blockManager.getDiskWriter(blockId, file, serializer, fileBufferSize,
@@ -173,8 +226,8 @@ class ExternalAppendOnlyMap[K, V, C](
     }
 
     var success = false
+
     try {
-      val it = currentMap.destructiveSortedIterator(keyComparator)
       while (it.hasNext) {
         val kv = it.next()
         writer.write(kv)
@@ -187,6 +240,7 @@ class ExternalAppendOnlyMap[K, V, C](
             curWriteMetrics)
         }
       }
+      logInfo(s"returning DiskMapIterator, records size is : ${objectsWritten}")
       if (objectsWritten > 0) {
         flush()
       } else if (writer != null) {
@@ -208,9 +262,7 @@ class ExternalAppendOnlyMap[K, V, C](
       }
     }
 
-    spilledMaps.append(new DiskMapIterator(file, blockId, batchSizes))
-
-    elementsRead = 0
+    return new DiskMapIterator(file, blockId, batchSizes)
   }
 
   def diskBytesSpilled: Long = _diskBytesSpilled
@@ -220,17 +272,48 @@ class ExternalAppendOnlyMap[K, V, C](
    * If no spill has occurred, simply return the in-memory map's iterator.
    */
   override def iterator: Iterator[(K, C)] = {
+    assertNotFinalized
+    logInfo(s"ExternalAppendOnlyMap ${System.identityHashCode(this)} is sending out an iterator, it's finalized!!")
     if (spilledMaps.isEmpty) {
-      currentMap.iterator
+      // when there is only memory map, no need to get the disruptiveSortedIterator since it will not be merged with the DiskIterator
+      exportedIterator = Some(SpillableMemIterator(memoryMap.iterator))// notice, since there is no DiskIterator, the map iterator does not need to be sorted
     } else {
-      new ExternalIterator()
+      logInfo(s"spilling ExternalAppendOnlyMap ${System.identityHashCode(this)}")
+      exportedIterator = Some(new SpillableExternalIterator())
+    }
+    exportedIterator.get
+  }
+
+
+  case class SpillableMemIterator(memIt: Iterator[(K,C)]) extends Iterator[(K,C)] {
+
+    var currentIt = memIt
+
+    var count = 0 ;
+    override def hasNext: Boolean = currentIt.hasNext
+
+    override def next(): (K, C) = {count+=1;currentIt.next()}
+
+    def spill(spillIt: Iterator[(K,C)] => Iterator[(K,C)]) = {
+      if (hasNext) {
+        currentIt = spillIt(currentIt)
+      } else {
+        //the memory iterator is already drained, release it by giving an empty iterator
+        currentIt = new Iterator[(K,C)]{
+            override def hasNext: Boolean = false
+            override def next(): (K, C) = null
+        }
+        logInfo("nothing in memory iterator, do nothing")
+      }
     }
   }
 
+
   /**
    * An iterator that sort-merges (K, C) pairs from the in-memory map and the spilled maps
+   * The in-memory map iterator could also be spilled after the iterator is returned to recycle memory
    */
-  private class ExternalIterator extends Iterator[(K, C)] {
+  private class SpillableExternalIterator extends Iterator[(K, C)] {
 
     // A queue that maintains a buffer for each stream we are currently merging
     // This queue maintains the invariant that it only contains non-empty buffers
@@ -238,15 +321,19 @@ class ExternalAppendOnlyMap[K, V, C](
 
     // Input streams are derived both from the in-memory map and spilled maps on disk
     // The in-memory map is sorted in place, while the spilled maps are already in sorted order
-    private val sortedMap = currentMap.destructiveSortedIterator(keyComparator)
-    private val inputStreams = (Seq(sortedMap) ++ spilledMaps).map(it => it.buffered)
+    val sortedSpillableMemoryMapIterator = SpillableMemIterator(memoryMap.destructiveSortedIterator(keyComparator))
+    private val combinedIterators = (Seq(sortedSpillableMemoryMapIterator) ++ spilledMaps).map(it => it.buffered).toList
 
-    inputStreams.foreach { it =>
+    combinedIterators.foreach { it =>
       val kcPairs = new ArrayBuffer[(K, C)]
       readNextHashCode(it, kcPairs)
       if (kcPairs.length > 0) {
         mergeHeap.enqueue(new StreamBuffer(it, kcPairs))
       }
+    }
+
+    def spillMemoryIterator(spillFunc:Iterator[(K, C)] => Iterator[(K, C)]) = {
+      sortedSpillableMemoryMapIterator.spill(spillFunc)
     }
 
     /**
